@@ -7,9 +7,9 @@
  *
  * ENVIRONMENT BEHAVIOR:
  * - Browser: Uses native Web Crypto API for SHA-256/SHA-512 (performance),
- *   'hash-wasm' for MD5/BLAKE3/CRC32 and when resumability is required.
+ *   'hash-wasm' for MD5/BLAKE3/CRC32/CRC32C and when resumability is required.
  * - Node.js: Uses native 'node:crypto' for SHA256/SHA512/MD5 (speed),
- *   'hash-wasm' for BLAKE3/CRC32 and when resumability is required.
+ *   'hash-wasm' for BLAKE3/CRC32/CRC32C and when resumability is required.
  *
  * RESUMABILITY:
  * To enable save/load state serialization, pass `{ resumable: true }` to the constructor.
@@ -40,8 +40,13 @@ export const HashMethod = {
     SHA256: 'sha256',
     SHA512: 'sha512',
     CRC32: 'crc32',
+    CRC32C: 'crc32c',
+    CRC32C_S3: 'crc32c-s3',  // S3 composite format: per-chunk CRC32C with composite on digest
     BLAKE3: 'blake3',
 } as const;
+
+/** CRC32C (Castagnoli) polynomial used by iSCSI, SCTP, ext4, and S3. */
+const CRC32C_POLYNOMIAL = 0x82f63b78;
 
 export type HashMethod = typeof HashMethod[keyof typeof HashMethod];
 
@@ -321,6 +326,10 @@ export class Hasher {
     private engine: HashEngine = 'wasm';
     private readonly resumable: boolean;
 
+    // S3 composite mode: track per-chunk CRC32C values
+    private s3ChunkChecksums: string[] = [];
+    private s3TempHasher: IHasher | null = null;  // reusable hasher for per-chunk computation
+
     constructor(method?: HashMethod, options?: HasherOptions) {
         this.method = method ?? this.method;
         this.resumable = options?.resumable ?? false;
@@ -332,6 +341,19 @@ export class Hasher {
             this.hasher = null;
             this.webCryptoHasher = null;
             this.engine = 'wasm';
+
+            // S3 composite mode: create reusable hasher for per-chunk computation
+            if (this.method === HashMethod.CRC32C_S3) {
+                this.s3TempHasher = await createCRC32(CRC32C_POLYNOMIAL);
+                this.s3ChunkChecksums = [];
+                this.hash = '';
+                this.timeStart = Date.now();
+                return {
+                    success: true,
+                    message: 'hash open success (S3 composite mode)',
+                    data: { method: this.method, engine: 'wasm', resumable: false }
+                };
+            }
 
             // If resumable is required, skip native implementations
             if (!this.resumable) {
@@ -372,6 +394,9 @@ export class Hasher {
                     case HashMethod.CRC32:
                         this.hasher = await createCRC32();
                         break;
+                    case HashMethod.CRC32C:
+                        this.hasher = await createCRC32(CRC32C_POLYNOMIAL);
+                        break;
                     case HashMethod.MD5:
                         this.hasher = await createMD5();
                         break;
@@ -402,7 +427,16 @@ export class Hasher {
 
     init(): IOResult<unknown> {
         try {
-            if(!this.hasher)
+            // S3 composite mode: reset chunk checksums
+            if (this.method === HashMethod.CRC32C_S3) {
+                this.s3ChunkChecksums = [];
+                this.hash = '';
+                this.timeElapsed = 0;
+                this.timeStart = Date.now();
+                return { success: true, message: 'hash init success (S3 composite mode)', data: { method: this.method } };
+            }
+
+            if (!this.hasher)
                 throw new Error('no hasher created. initialize first.');
 
             this.hash = '';
@@ -410,21 +444,46 @@ export class Hasher {
             this.timeElapsed = 0;
             this.timeStart = Date.now();
 
-            return { success: true, message: 'hash init success', data: { method: this.method }};
-        } catch(error) {
-            return { success: false, message: 'hash init failed', data: { error: getErrorString(error) }};
+            return { success: true, message: 'hash init success', data: { method: this.method } };
+        } catch (error) {
+            return { success: false, message: 'hash init failed', data: { error: getErrorString(error) } };
         }
     }
 
     update(data: IDataType): IOResult<unknown> {
         try {
-            if(!this.hasher)
+            // S3 composite mode: compute CRC32C for this chunk and store base64
+            if (this.method === HashMethod.CRC32C_S3) {
+                if (!this.s3TempHasher)
+                    throw new Error('S3 hasher not initialized. call open() first.');
+
+                // Compute CRC32C for this chunk using the reusable hasher
+                this.s3TempHasher.init();
+                this.s3TempHasher.update(data);
+                const binaryHash = this.s3TempHasher.digest('binary') as Uint8Array;
+
+                // Convert to base64 (S3 expects base64-encoded binary)
+                const base64 = uint8ArrayToBase64(binaryHash);
+                this.s3ChunkChecksums.push(base64);
+
+                return {
+                    success: true,
+                    message: 'hash update success (S3 chunk)',
+                    data: {
+                        method: this.method,
+                        size: data.length,
+                        chunkIndex: this.s3ChunkChecksums.length - 1,
+                    }
+                };
+            }
+
+            if (!this.hasher)
                 throw new Error('no hasher created. initialize first.');
 
             this.hasher.update(data);
-            return { success: true, message: 'hash update success', data: { method: this.method, size: data.length }};
-        } catch(error) {
-            return { success: false, message: 'hash update failed', data: { error: getErrorString(error) }};
+            return { success: true, message: 'hash update success', data: { method: this.method, size: data.length } };
+        } catch (error) {
+            return { success: false, message: 'hash update failed', data: { error: getErrorString(error) } };
         }
     }
 
@@ -434,6 +493,47 @@ export class Hasher {
      */
     digest(): IOResult<unknown> {
         try {
+            // S3 composite mode: compute composite from per-chunk checksums
+            if (this.method === HashMethod.CRC32C_S3) {
+                if (this.s3ChunkChecksums.length === 0) {
+                    return { success: false, message: 'digest failed: no chunks hashed' };
+                }
+
+                // Concatenate all chunk checksums as binary
+                const totalLength = this.s3ChunkChecksums.reduce((sum, b64) => sum + base64ToUint8Array(b64).length, 0);
+                const concatenated = new Uint8Array(totalLength);
+                let offset = 0;
+                for (const b64 of this.s3ChunkChecksums) {
+                    const bytes = base64ToUint8Array(b64);
+                    concatenated.set(bytes, offset);
+                    offset += bytes.length;
+                }
+
+                // Compute CRC32C of concatenated checksums
+                if (!this.s3TempHasher)
+                    throw new Error('S3 hasher not initialized.');
+
+                this.s3TempHasher.init();
+                this.s3TempHasher.update(concatenated);
+                const compositeBinary = this.s3TempHasher.digest('binary') as Uint8Array;
+                const compositeBase64 = uint8ArrayToBase64(compositeBinary);
+
+                // S3 composite format: base64-checksum + "-" + numParts
+                this.hash = `${compositeBase64}-${this.s3ChunkChecksums.length}`;
+                this.timeElapsed = Date.now() - this.timeStart;
+
+                return {
+                    success: true,
+                    message: 'hash digest success (S3 composite)',
+                    data: {
+                        method: this.method,
+                        hash: this.hash,
+                        timeElapsed: this.timeElapsed,
+                        partsCount: this.s3ChunkChecksums.length,
+                    }
+                };
+            }
+
             if (!this.hasher)
                 throw new Error('no hasher created. initialize first.');
 
@@ -453,6 +553,11 @@ export class Hasher {
     /** Finalize and get the hash (async version, works with all engines). */
     async digestAsync(): Promise<IOResult<unknown>> {
         try {
+            // S3 composite mode: use sync digest (no async needed for WASM)
+            if (this.method === HashMethod.CRC32C_S3) {
+                return this.digest();
+            }
+
             if (!this.hasher)
                 throw new Error('no hasher created. initialize first.');
 
@@ -481,6 +586,10 @@ export class Hasher {
 
     /** Returns true if this hasher supports save/load state serialization. */
     isResumable(): boolean {
+        // S3 composite mode is never resumable (tracks per-chunk checksums, not streaming state)
+        if (this.method === HashMethod.CRC32C_S3) {
+            return false;
+        }
         return this.engine === 'wasm';
     }
 
@@ -556,6 +665,10 @@ export class Hasher {
                 return Hasher.blake3(data);
             case HashMethod.CRC32:
                 return Hasher.crc32(data);
+            case HashMethod.CRC32C:
+                return Hasher.crc32c(data);
+            case HashMethod.CRC32C_S3:
+                throw new Error('CRC32C_S3 requires streaming mode (open/update/digest)');
             case HashMethod.MD5:
                 return Hasher.md5(data);
         }
@@ -588,10 +701,61 @@ export class Hasher {
     }
 
     static async crc32(data: IDataType, limit: number = 0): Promise<string> {
-        // CRC32 only available via WASM
+        // CRC32 (IEEE) only available via WASM
         const result: string = await crc32(data);
         if (limit > 0) return result.substring(0, limit);
         return result;
+    }
+
+    static async crc32c(data: IDataType, limit: number = 0): Promise<string> {
+        // CRC32C (Castagnoli) only available via WASM
+        const result: string = await crc32(data, CRC32C_POLYNOMIAL);
+        if (limit > 0) return result.substring(0, limit);
+        return result;
+    }
+
+    /**
+     * Compute CRC32C and return as base64-encoded binary (for S3 ChecksumCRC32C).
+     * S3 expects checksums as base64-encoded 4-byte binary, not hex strings.
+     */
+    static async crc32cBase64(data: IDataType): Promise<string> {
+        const hasher = await createCRC32(CRC32C_POLYNOMIAL);
+        hasher.init();
+        hasher.update(data);
+        const binaryHash = hasher.digest('binary');
+        return uint8ArrayToBase64(binaryHash);
+    }
+
+    /**
+     * Compute S3-compatible composite checksum from per-part CRC32C values.
+     * S3 composite format: base64(CRC32C(part1_bytes || part2_bytes || ...)) + "-" + numParts
+     * @param partChecksums - Array of base64-encoded CRC32C values (one per part)
+     * @returns S3-format composite checksum string (e.g., "abcd1234==-5")
+     */
+    static async computeS3CompositeChecksum(partChecksums: string[]): Promise<string> {
+        if (partChecksums.length === 0) {
+            throw new Error('Cannot compute composite checksum from empty array');
+        }
+
+        // Concatenate all part checksums as binary (each is 4 bytes)
+        const totalLength = partChecksums.reduce((sum, b64) => sum + base64ToUint8Array(b64).length, 0);
+        const concatenated = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const b64 of partChecksums) {
+            const bytes = base64ToUint8Array(b64);
+            concatenated.set(bytes, offset);
+            offset += bytes.length;
+        }
+
+        // Compute CRC32C of concatenated checksums
+        const compositeHex = await crc32(concatenated, CRC32C_POLYNOMIAL);
+
+        // Convert hex to binary to base64
+        const compositeBytes = new Uint8Array(compositeHex.match(/.{2}/g)!.map(byte => parseInt(byte, 16)));
+        const compositeBase64 = uint8ArrayToBase64(compositeBytes);
+
+        // S3 format: base64-checksum + "-" + number of parts
+        return `${compositeBase64}-${partChecksums.length}`;
     }
 
     static async sha256(data: IDataType, limit: number = 0): Promise<string> {

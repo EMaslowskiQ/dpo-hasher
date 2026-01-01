@@ -84,17 +84,21 @@ hasher2.update(chunk3); // Continue from where we left off
 | `blake3` | Default, fast and secure | Fastest | 64 hex chars |
 | `sha256` | Compatibility, widely supported | Fast | 64 hex chars |
 | `sha512` | Higher security margin | Fast | 128 hex chars |
-| `crc32` | Quick checksums, non-cryptographic | Very Fast | 8 hex chars |
+| `crc32` | Quick checksums (IEEE polynomial) | Very Fast | 8 hex chars |
+| `crc32c` | iSCSI, ext4 (Castagnoli polynomial) | Very Fast | 8 hex chars |
+| `crc32c-s3` | S3 multipart uploads (composite format) | Very Fast | base64 + part count |
 | `md5` | Legacy compatibility only | Fast | 32 hex chars |
 
 ```typescript
 import { HashMethod } from 'ref-hasher';
 
-HashMethod.BLAKE3  // 'blake3'
-HashMethod.SHA256  // 'sha256'
-HashMethod.SHA512  // 'sha512'
-HashMethod.CRC32   // 'crc32'
-HashMethod.MD5     // 'md5'
+HashMethod.BLAKE3    // 'blake3'
+HashMethod.SHA256    // 'sha256'
+HashMethod.SHA512    // 'sha512'
+HashMethod.CRC32     // 'crc32'
+HashMethod.CRC32C    // 'crc32c'
+HashMethod.CRC32C_S3 // 'crc32c-s3'
+HashMethod.MD5       // 'md5'
 ```
 
 ---
@@ -189,7 +193,12 @@ Hasher.md5(data: IDataType, limit?: number): Promise<string>
 Hasher.sha256(data: IDataType, limit?: number): Promise<string>
 Hasher.sha512(data: IDataType, limit?: number): Promise<string>
 Hasher.crc32(data: IDataType, limit?: number): Promise<string>
+Hasher.crc32c(data: IDataType, limit?: number): Promise<string>
 Hasher.blake3(data: IDataType, limit?: number): Promise<string>
+
+// S3-specific helpers
+Hasher.crc32cBase64(data: IDataType): Promise<string>
+Hasher.computeS3CompositeChecksum(partChecksums: string[]): Promise<string>
 ```
 
 The `limit` parameter truncates the hash to the first N characters (useful for short IDs).
@@ -215,7 +224,7 @@ interface HashStateSnapshot {
 }
 
 type HashEngine = 'wasm' | 'node-native' | 'web-crypto';
-type HashMethod = 'md5' | 'sha256' | 'sha512' | 'crc32' | 'blake3';
+type HashMethod = 'md5' | 'sha256' | 'sha512' | 'crc32' | 'crc32c' | 'crc32c-s3' | 'blake3';
 
 // IDataType from hash-wasm: string | ArrayBuffer | Uint8Array | Buffer
 ```
@@ -352,6 +361,51 @@ hasher.init();
 hasher.update(data2);
 const hash2 = (await hasher.digestAsync()).data.hash;
 ```
+
+### Pattern 6: S3 Multipart Upload with Composite Checksum
+
+```typescript
+import { Hasher, HashMethod } from 'ref-hasher';
+
+// Method 1: Using CRC32C_S3 streaming mode
+async function uploadWithS3Checksum(file: File, uploadPart: Function) {
+  const hasher = new Hasher(HashMethod.CRC32C_S3);
+  await hasher.open();
+
+  const chunkSize = 8 * 1024 * 1024; // 8 MB
+  let partNumber = 1;
+
+  for (let offset = 0; offset < file.size; offset += chunkSize) {
+    const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
+    const data = new Uint8Array(chunk);
+
+    // Each update() computes per-chunk CRC32C internally
+    hasher.update(data);
+
+    // Get the per-chunk checksum for S3 ChecksumCRC32C header
+    const chunkChecksum = await Hasher.crc32cBase64(data);
+    await uploadPart(partNumber++, data, chunkChecksum);
+  }
+
+  // digest() returns S3 composite format: "base64checksum-partCount"
+  const result = hasher.digest();
+  return result.data.hash; // e.g., "gVZk2w==-5"
+}
+
+// Method 2: Using static helper with pre-computed checksums
+async function computeCompositeFromParts(partChecksums: string[]) {
+  // partChecksums is an array of base64-encoded CRC32C values
+  const composite = await Hasher.computeS3CompositeChecksum(partChecksums);
+  return composite; // e.g., "gVZk2w==-5"
+}
+```
+
+**S3 Composite Format:**
+- Each part has its own CRC32C checksum (base64-encoded 4 bytes)
+- Final checksum: `base64(CRC32C(part1_crc || part2_crc || ...)) + "-" + partCount`
+- Example: `"gVZk2w==-5"` means composite checksum `gVZk2w==` from 5 parts
+
+**Important:** `CRC32C_S3` is NOT resumable. It tracks per-chunk checksums, not streaming hash state.
 
 ---
 
