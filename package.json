@@ -1,7 +1,7 @@
 {
   "name": "ref-hasher",
   "version": "0.1.0",
-  "description": "",
+  "description": "Universal hashing library with automatic engine selection",
   "homepage": "https://github.com/EMaslowskiQ/ref-hasher#readme",
   "bugs": {
     "url": "https://github.com/EMaslowskiQ/ref-hasher/issues"
@@ -13,12 +13,28 @@
   "license": "ISC",
   "author": "",
   "type": "module",
-  "main": "index.js",
-  "directories": {
-    "doc": "docs"
+  "main": "./dist/hasher.js",
+  "module": "./dist/hasher.js",
+  "types": "./dist/hasher.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/hasher.js",
+      "types": "./dist/hasher.d.ts"
+    }
   },
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rimraf dist",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "yalc:publish": "npm run build && yalc publish --push",
+    "watch:publish": "tsc --watch --preserveWatchOutput & chokidar \"dist/**/*.js\" -c \"yalc publish --push\""
   },
   "dependencies": {
     "hash-wasm": "^4.12.0"

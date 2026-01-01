@@ -31,4 +31,8 @@ npm-debug.log*
 # Coverage
 coverage/
 
+# Yalc
+.yalc/
+yalc.lock
+
 CLAUDE.md
