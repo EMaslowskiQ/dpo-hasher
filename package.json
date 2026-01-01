@@ -1,0 +1,29 @@
+{
+  "name": "ref-hasher",
+  "version": "0.1.0",
+  "description": "",
+  "homepage": "https://github.com/EMaslowskiQ/ref-hasher#readme",
+  "bugs": {
+    "url": "https://github.com/EMaslowskiQ/ref-hasher/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EMaslowskiQ/ref-hasher.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "hash-wasm": "^4.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3"
+  }
+}
